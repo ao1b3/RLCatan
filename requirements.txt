@@ -1,0 +1,6 @@
+catanatron @ git+https://github.com/bcollazo/catanatron.git@ecf931181b9a65bb4116a2153fb78c16f1438e00
+sb3-contrib==2.9.0
+stable-baselines3==2.9.0
+gymnasium==1.3.0
+numpy==2.5.3
+torch==2.14.0

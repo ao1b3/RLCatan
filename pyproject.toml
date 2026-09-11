@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlcatan"
+version = "0.1.0"
+description = "Train and evaluate masked-PPO Settlers of Catan agents on Catanatron."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "catanatron @ git+https://github.com/bcollazo/catanatron.git@ecf931181b9a65bb4116a2153fb78c16f1438e00",
+    "sb3-contrib==2.9.0",
+    "stable-baselines3==2.9.0",
+    "gymnasium==1.3.0",
+    "numpy==2.5.3",
+    "torch==2.14.0",
+]
+
+[project.scripts]
+rlcatan-train = "rlcatan.training:main"
+rlcatan-benchmark = "rlcatan.benchmark:main"
+
+[tool.setuptools]
+packages = ["rlcatan"]
