@@ -23,8 +23,9 @@ python3 -m venv .venv
 
 The `rlcatan-train` and `rlcatan-benchmark` console scripts are equivalent.
 
-`project` is the two-player policy. `players` is for multiplayer training.
-`actions` is the compact two-player action policy; `mlp` is the baseline.
+`project` is the two-player policy. `actions` is the compact two-player action
+policy. `mlp` is the baseline. Add `--multiplayer` to train on two to four
+players; that format always reads the per-player blocks, so it uses `mlp`.
 
 Use `--shaping .5` to reward progress toward victory and balanced resource
 production during training. Evaluation and browser play use the original game
@@ -53,8 +54,9 @@ games afterward.
 Each run directory keeps `model.zip` beside the `run.json` that records its
 rules, seeds, and source hashes; the two must stay together. Runs trained
 before the modules moved into the `rlcatan` package pickled their policy
-classes under the old top-level names, and `rlcatan.compat` aliases those on
-demand so the checkpoints still load.
+classes under the old top-level names. `LEGACY_MODULES` in
+`rlcatan.training` maps each old name to the file that now holds the class, so
+those checkpoints still load.
 
 Generated runs and models are ignored by Git.
 
