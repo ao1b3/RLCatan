@@ -1,7 +1,7 @@
 # RLCatan
 
 Train and evaluate masked-PPO Settlers of Catan agents on top of
-[Catanatron](https://github.com/bcollazo/catanatron).
+[Catanatron](https://github.com/bcollazo/catanatron), instead of trying to simulate internally...
 
 This repository holds the environment, training, and evaluation code. The
 browser interface for playing against a trained model is developed separately
