@@ -17,6 +17,34 @@ from catanatron.state_functions import (get_player_freqdeck, player_key,
 
 from .game import node_yield, player_income
 
+
+def trade_terms(state, color, action):
+    """Return what this player would give and get in the trade of an action,
+    and the other party's public score.
+
+    An offer and a confirmation give the offering and get the asking; an
+    acceptance gives the asking and gets the offering. The party is the
+    acceptee for a confirmation, the offerer for an answer, and nobody for
+    an offer.
+    """
+    kind, value = action.action_type, action.value
+    offering, asking = np.array(value[:5]), np.array(value[5:10])
+    if kind == A.ACCEPT_TRADE:
+        party = state.colors[value[10]]
+        give, get = asking, offering
+    else:
+        party = value[10] if kind == A.CONFIRM_TRADE else None
+        give, get = offering, asking
+    score = 0 if party is None else state.player_state[player_key(state, party) + "_VICTORY_POINTS"]
+    return give, get, score
+
+
+def helps_a_leader(state, color, party_score, target):
+    """Whether a trade would help a player who is about to win, or who is
+    well ahead once the game is past its opening."""
+    mine = state.player_state[player_key(state, color) + "_VICTORY_POINTS"]
+    return party_score >= target - 2 or (party_score >= mine + 2 and party_score >= 6)
+
 ROAD = np.array([1, 1, 0, 0, 0])
 SETTLEMENT = np.array([1, 1, 1, 1, 0])
 CITY = np.array([0, 0, 0, 2, 3])
@@ -26,21 +54,24 @@ DEVELOPMENT = np.array([0, 0, 1, 1, 1])
 def pick_best(env, scores):
     """Return the action with the best score. Break a tie at random.
 
-    The caller decides the order of the scores. That order decides which action
-    a tie gives, so it must stay the same to repeat a game exactly.
+    The tie is drawn from the actions in table order, whatever order the
+    caller scored them in, so a seed repeats a game exactly.
     """
     best = max(scores.values())
-    return int(env.np_random.choice([action for action, score in scores.items() if score == best]))
+    return int(env.np_random.choice(sorted(action for action, score in scores.items() if score == best)))
 
 
 def tile_buildings(state, tile):
-    """Return the owner and the kind of every building on one tile."""
     return [entry for node in tile.nodes.values()
             if (entry := state.board.buildings.get(node)) is not None]
 
 
+def maritime_terms(value):
+    return (RESOURCES.index(value[0]), RESOURCES.index(value[-1]),
+            sum(card is not None for card in value[:-1]))
+
+
 def choose_action(env, color=None, kind="random"):
-    """Take a random action, or the action with the best immediate value."""
     color = env.learner if color is None else color
     legal = env.legal(color)
     if kind == "random":
@@ -70,6 +101,15 @@ def choose_action(env, color=None, kind="random"):
             # This looks one step ahead only. Search the tree if a stronger
             # opponent proves to be worth the time.
             return 10 + (hand[RESOURCES.index(value[0])] - hand[RESOURCES.index(value[-1])]) / 100
+        if kind in (A.OFFER_TRADE, A.ACCEPT_TRADE, A.CONFIRM_TRADE):
+            give, get, party = trade_terms(state, color, action)
+            if helps_a_leader(state, color, party, env.config.target_vp):
+                return -1
+            # Give from a surplus, get what is missing.
+            surplus = (hand - give)[give > 0].min() >= 1 and (hand[get > 0] == 0).all()
+            if kind == A.OFFER_TRADE:
+                return 11 - 5 * max(get.sum() - give.sum(), 0) if surplus else -1
+            return 1 if surplus and give.sum() <= get.sum() else -1
         return {A.ROLL: 50, A.BUY_DEVELOPMENT_CARD: 40, A.PLAY_KNIGHT_CARD: 35,
                 A.PLAY_ROAD_BUILDING: 35, A.END_TURN: 0}.get(kind, 0)
 
@@ -124,10 +164,27 @@ def builder(env, color, style="builder"):
         if kind == A.BUY_DEVELOPMENT_CARD:
             return 0 if save_city else 130 if style == "development" else 50
         if kind == A.MARITIME_TRADE:
-            give, take = RESOURCES.index(value[0]), RESOURCES.index(value[-1])
-            if hand[give] - (len(value) - 1) < target[give] or hand[take] >= target[take]:
+            give, take, cost = maritime_terms(value)
+            if hand[give] - cost < target[give] or hand[take] >= target[take]:
                 return 0
             return 30 + (target[take] - hand[take]) / (income[take] + .1)
+        if kind in (A.OFFER_TRADE, A.ACCEPT_TRADE, A.CONFIRM_TRADE):
+            given, got, party = trade_terms(state, color, action)
+            if helps_a_leader(state, color, party, env.config.target_vp):
+                return -1
+            after = hand - given + got
+            # The trade must keep the target's cards and fill one of its gaps.
+            if (after < np.minimum(hand, target)).any() or not ((hand < target) & (got > 0)).any():
+                return -1 if kind != A.OFFER_TRADE else 0
+            # Two cards for one only when the one finishes the target.
+            if given.sum() > got.sum() and (after < target).any():
+                return -1
+            need = ((target - hand).clip(0) * got).sum()
+            if kind == A.OFFER_TRADE:
+                if (after < target).any():
+                    return 0
+                return 31 + need / (income[got > 0].min() + .1) - 25 * max(got.sum() - given.sum(), 0)
+            return 1 + need
         if kind == A.DISCARD_RESOURCE:
             resource = RESOURCES.index(value)
             return (hand[resource] - target[resource]) / (income[resource] + .1)
@@ -150,7 +207,6 @@ def builder(env, color, style="builder"):
 
 
 def noisy_builder(env, color):
-    """The builder style, but it takes a random action once in twenty."""
     legal = env.legal(color)
     if len(legal) > 1 and env.np_random.random() < .05:
         return int(env.np_random.choice(sorted(legal)))
@@ -158,11 +214,6 @@ def noisy_builder(env, color):
 
 
 def _readiness(cards, can_settle, can_city, can_buy):
-    """Return how close a hand is to its best project.
-
-    A project that is out of reach scores lower. Each missing card costs the
-    same amount, so a trade that fills a gap always raises this number.
-    """
     projects = []
     if can_buy:
         projects.append(180 - 35 * np.maximum(DEVELOPMENT - cards, 0).sum())
@@ -195,6 +246,10 @@ def planner(env, color, contender=False, feasible=False, available=False):
     def readiness(cards):
         return _readiness(cards, can_settle, can_city, can_buy)
 
+    def finishes(cards):
+        return any(allowed and (cards >= cost).all() for allowed, cost in
+                   ((can_buy, DEVELOPMENT), (can_settle, SETTLEMENT), (can_city, CITY)))
+
     current = readiness(hand)
 
     def site(node):
@@ -225,10 +280,25 @@ def planner(env, color, contender=False, feasible=False, available=False):
                 return reach + readiness(hand - ROAD) - current
             return reach
         if kind == A.MARITIME_TRADE:
+            give, take, cost = maritime_terms(value)
             after = hand.copy()
-            after[RESOURCES.index(value[0])] -= len(value) - 1
-            after[RESOURCES.index(value[-1])] += 1
+            after[give] -= cost
+            after[take] += 1
             return readiness(after) - current
+        if kind in (A.OFFER_TRADE, A.ACCEPT_TRADE, A.CONFIRM_TRADE):
+            given, got, party = trade_terms(state, color, action)
+            if helps_a_leader(state, color, party, env.config.target_vp):
+                return -1
+            after = hand - given + got
+            gain = readiness(after) - current
+            if given.sum() > got.sum() and not finishes(after):
+                return -1
+            if kind == A.OFFER_TRADE:
+                # Ask only for the cards that finish a project. An even offer
+                # goes before the bank; asking for more than it gives is a last
+                # resort, because nobody takes it.
+                return gain + 1 - 40 * max(got.sum() - given.sum(), 0) if gain > 0 and finishes(after) else -1
+            return gain if gain > 0 else -1
         if kind == A.BUY_DEVELOPMENT_CARD:
             return 220 + (30 if state.player_state[key + "_HAS_ARMY"] else 0)
         if kind == A.MOVE_ROBBER:
@@ -263,6 +333,30 @@ def planner(env, color, contender=False, feasible=False, available=False):
     return max(legal, key=lambda action_id: (score(legal[action_id]), -action_id))
 
 
+def library_player(cls, **params):
+    from .game import action_id
+    players = {}
+
+    def decide(env, color):
+        if color not in players:
+            players[color] = cls(color, params=cls.Params(**params))
+        legal = env.legal(color)
+        if env.game.state.is_resolving_trade:
+            # The library players do not trade: they decline every offer.
+            return next(iter(legal))
+        action = players[color].decide(env.game, env.game.playable_actions)
+        return action_id(action, color, env.game.state.colors, *env.config.table)
+
+    return decide
+
+
+def _library(name):
+    from catanatron.players.minimax import AlphaBetaPlayer
+    from catanatron.players.value import ValueFunctionPlayer
+    return {"value": library_player(ValueFunctionPlayer),
+            "alphabeta": library_player(AlphaBetaPlayer, depth=2, prunning=True)}[name]
+
+
 # Every scripted player, by the name that the command line uses.
 SCRIPTED = {
     "random": partial(choose_action, kind="random"),
@@ -276,11 +370,20 @@ SCRIPTED = {
     "planner-feasible": partial(planner, feasible=True),
     "planner-available": partial(planner, feasible=True, available=True),
 }
+LIBRARY = ("value", "alphabeta")
 
 
 def opponent_for(name, config):
-    """Return a scripted player, or a saved model that plays as an opponent."""
+    """Return a scripted player, a library player, or a saved model that plays
+    as an opponent."""
     if name in SCRIPTED:
         return SCRIPTED[name]
+    if name in LIBRARY:
+        return _library(name)
     from .training import frozen_opponent
     return frozen_opponent(name, config)
+
+
+if __name__ == "__main__":
+    assert maritime_terms(("WOOD", "WOOD", None, None, "BRICK")) == (0, 1, 2)
+    print("ok")

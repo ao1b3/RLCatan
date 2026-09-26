@@ -1,20 +1,13 @@
-"""Train a policy with masked PPO.
-
-The stable-baselines3 library does the PPO maths. This file prepares the
-environment, the opponents and the warm start, and it records what each run
-used.
-"""
+"""Train masked PPO and record its rules, opponents, sources and metrics."""
 import argparse
-import csv
 import hashlib
-import importlib
 import json
+import os
 import platform
-import shutil
-import sys
 import time
 from dataclasses import asdict
-from importlib.metadata import version
+from collections import Counter, defaultdict
+from importlib.metadata import requires, version
 from pathlib import Path
 
 import gymnasium as gym
@@ -24,282 +17,266 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.vec_env import DummyVecEnv
+from catanatron.models.actions import Action
+from catanatron.models.enums import ActionType
+from catanatron.models.player import Color
 from catanatron.state_functions import get_actual_victory_points
 
-from .game import CatanEnv, Config, player_income
+from .game import CatanEnv, Config, action_table, player_income, winner
 
-# Models trained before these modules moved into the rlcatan package name their
-# classes by the old module. Point the old names at the file that now holds the
-# class, so that those saved models still load.
-LEGACY_MODULES = {"game": "game", "agents": "opponents", "teacher": "opponents",
-                  "strong_teacher": "opponents", "features": "policies",
-                  "action_policy": "policies", "project_policy": "policies",
-                  "multiplayer": "policies", "training": "training", "benchmark": "benchmark"}
 SOURCE_FILES = {path.name: path.read_bytes() for path in sorted(Path(__file__).parent.glob("*.py"))}
-
-
-def install_legacy_module_aliases():
-    for old, new in LEGACY_MODULES.items():
-        sys.modules.setdefault(old, importlib.import_module("." + new, __package__))
-
 
 def file_sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
-
 def model_path(path):
-    """Return the path of the saved model. A run directory holds model.zip."""
+    """Resolve a run directory to model.zip."""
     path = Path(path)
     return path / "model.zip" if path.is_dir() else path
 
-
 def runtime():
-    """Return what produced a run: the machine, the sources and the packages."""
+    """Record the machine, source hashes and package versions."""
     return {"python": platform.python_version(), "platform": platform.platform(),
+            "threads": torch.get_num_threads(),
             "source_sha256": {name: hashlib.sha256(data).hexdigest()
                               for name, data in SOURCE_FILES.items()},
             "packages": {p: version(p) for p in ("catanatron", "numpy", "torch", "gymnasium",
                                                  "stable-baselines3", "sb3-contrib")}}
 
+def config_from_metadata(metadata):
+    """Validate saved observation format and discard the retired multiplayer flag."""
+    if metadata["format"] not in (3, 5):
+        raise ValueError("Unsupported observation format")
+    # Old metadata keeps this flag even when the retired format was unused.
+    rules = dict(metadata["game"])
+    if rules.pop("multiplayer", False):
+        raise ValueError("Format 4 models are no longer supported")
+    config = Config(**rules)
+    if config.seats != (metadata["format"] == 5):
+        raise ValueError("The saved format does not match the saved rules")
+    return config
 
-def load_policy(path):
-    """Load a saved model and the rules that it was trained on.
-
-    Read the rules from the run.json beside the model. Never guess the rules
-    from the size of the arrays.
-    """
+def load_policy(path, **overrides):
+    """Load rules and weights; inference needs only a tiny unused rollout buffer."""
     path = model_path(path)
     metadata = json.loads((path.parent / "run.json").read_text())
-    if metadata["format"] not in (3, 4):
-        raise ValueError("Unsupported observation format")
-    config = Config(**metadata["game"])
-    if config.multiplayer != (metadata["format"] == 4):
-        raise ValueError("The saved format does not match the saved rules")
+    config = config_from_metadata(metadata)
+    overrides = {"n_steps": 2, "n_envs": 1, "batch_size": 2, **overrides}
     try:
-        model = MaskablePPO.load(path, device="cpu")
-    except ModuleNotFoundError as error:
-        if error.name not in LEGACY_MODULES:
+        model = MaskablePPO.load(path, device="cpu", custom_objects=overrides)
+    except RuntimeError as error:
+        if "size mismatch for " not in str(error):
             raise
-        install_legacy_module_aliases()
-        model = MaskablePPO.load(path, device="cpu")
+        # Zero new inputs when loading weights saved before the network grew.
+        from stable_baselines3.common.save_util import load_from_zip_file
+        data, params, _ = load_from_zip_file(path, device="cpu", custom_objects=overrides)
+        model = MaskablePPO(data["policy_class"], None, device="cpu", _init_setup_model=False)
+        model.__dict__.update(data)
+        model._setup_model()
+        transfer_weights(model.policy, params["policy"])
+    # The critic of a shaped run scores a position less its potential.
+    model.shaping = metadata.get("shaping", 0.0)
     return model, config
 
+def transfer_weights(policy, source):
+    """Copy a smaller network, zeroing grown weights; keep current code-defined buffers."""
+    buffers = {name for name, _ in policy.named_buffers()}
+    state = policy.state_dict()
+    tables = {"kinds", "endpoints", "endpoint_masks", "tiles", "tile_masks", "give", "take", "delta", "count"}
+    unexpected = [key for key in source if key not in state and key.rsplit(".", 1)[-1] not in tables]
+    missing = [key for key in state if key not in source and key not in buffers]
+    if unexpected or any(not key.startswith("mlp_extractor.") for key in missing):
+        raise ValueError(f"transfer does not fit this network: {missing} {unexpected}")
+    for key, value in source.items():
+        if key in buffers or key not in state:
+            continue
+        target = state[key]
+        if value.shape != target.shape:
+            if value.dim() != target.dim() or any(v > t for v, t in zip(value.shape, target.shape)):
+                raise ValueError(f"{key}: {tuple(value.shape)} does not fit {tuple(target.shape)}")
+            grown = torch.zeros_like(target)
+            grown[tuple(slice(0, n) for n in value.shape)] = value
+            value = grown
+        state[key] = value
+    policy.load_state_dict(state)
 
 def frozen_opponent(path, config):
-    """Return a player that takes the best action of a saved model."""
+    """Play saved weights using their original observation and action table.
+
+    Unnamed robber victims map to the leading opponent; unsupported trades are declined."""
+    from .game import action_id
     model, rules = load_policy(path)
-    if rules.target_vp != config.target_vp or rules.multiplayer != config.multiplayer:
-        raise ValueError("A saved opponent must use the same rules")
-    # Keep the network only. The optimiser and the rollout buffer of the saved
-    # model are large and are never used here.
+    if rules.target_vp != config.target_vp:
+        raise ValueError("A saved opponent must use the same victory target")
+    # Prediction uses the policy without retaining the PPO rollout buffer.
     policy = model.policy
+    translate = rules.table != config.table
+    size = len(action_table(*rules.table))
 
     def decide(env, color):
-        mask = env.mask_for(color)
-        if mask.sum() == 1:
-            return int(mask.argmax())
-        action, _ = policy.predict(env.observe(color), deterministic=True, action_masks=mask)
-        return int(action)
+        legal = env.legal(color)
+        if len(legal) == 1:
+            return next(iter(legal))
+        obs = env.observe(color, rules.counted, rules.seats, rules.trading)
+        if not translate:
+            action, _ = policy.predict(obs, deterministic=True, action_masks=env._mask_of(legal))
+            return int(action)
+        colors = env.game.state.colors
+        offered = {}
+        for number, action in legal.items():
+            if (not rules.relative_actions and action.action_type == ActionType.MOVE_ROBBER
+                    and action.value[1] is not None):
+                action = Action(color, action.action_type, (action.value[0], Color.RED))
+                key = action_id(action, Color.BLUE, (Color.BLUE, Color.RED), False, rules.trading)
+                offered.setdefault(key, number)
+                continue
+            try:
+                offered.setdefault(action_id(action, color, colors, *rules.table), number)
+            except KeyError:
+                continue
+        if not offered:
+            # Nothing it can name: the legal actions are answers to an offer.
+            return next(iter(legal))
+        mask = np.zeros(size, dtype=bool)
+        mask[list(offered)] = True
+        action, _ = policy.predict(obs, deterministic=True, action_masks=mask)
+        return offered[int(action)]
 
     return decide
 
-
 class League:
-    """A fixed roster of opponents.
+    """Choose one opponent per seat, weighted by learner losses during training.
 
-    Each player in a game keeps one opponent for the whole game. The roster
-    itself never changes.
-    """
+    Evaluation freezes uniform assignments by board seed and learner seat."""
 
-    def __init__(self, names, config):
+    def __init__(self, names, config, floor=.25, adaptive=True):
         from .opponents import opponent_for
         if not names:
             raise ValueError("A league needs at least one opponent")
         self.names = list(map(str, names))
         self.opponents = [opponent_for(name, config) for name in self.names]
+        self.floor = floor
+        self.adaptive = adaptive
+        self.wins = np.zeros(len(self.names))
+        self.games = np.zeros(len(self.names))
+
+    def weights(self):
+        # Start every member near even, then follow the learner's losses.
+        odds = self.floor + (self.games - self.wins + 1) / (self.games + 2)
+        return odds / odds.sum()
+
+    def record(self, game, picks, learner):
+        """Count each participating member when the game has a winner."""
+        won = winner(game)
+        if won is None:
+            return
+        for index in picks.values():
+            self.games[index] += 1
+            self.wins[index] += won == learner
 
     def __call__(self, env, color):
         chosen = getattr(env, "league_choice", None)
         if chosen is None or chosen[0] is not env.game:
-            picks = {c: int(env.np_random.integers(len(self.opponents)))
+            if chosen is not None and self.adaptive:
+                self.record(*chosen)
+            # Evaluation assigns opponents from the board and seat, independent
+            # of game scheduling and of the evaluated policy's random draws.
+            rng = env.np_random if self.adaptive else np.random.default_rng([env.seed_value, env.seat])
+            weights = self.weights() if self.adaptive else None
+            picks = {c: int(rng.choice(len(self.opponents), p=weights))
                      for c in env.game.state.colors if c != env.learner}
-            chosen = (env.game, picks)
+            chosen = (env.game, picks, env.learner)
             env.league_choice = chosen
         env.opponent_name = "+".join(self.names[i] for i in chosen[1].values())
         return self.opponents[chosen[1][color]](env, color)
 
+def potential(env, scale):
+    """Progress potential: add it back to a shaped critic to recover true value."""
+    state = env.game.state
+    points = get_actual_victory_points(state, env.learner)
+    # Reward resource spread; ignore the robber so moving it cannot inflate income.
+    income = player_income(state, env.learner)
+    return scale * (points / env.config.target_vp + .2 * np.sqrt(income).sum())
 
-class DecisionSteps(gym.Wrapper):
-    """Count a step only when the learner has a real choice.
+class TrainingEnv(gym.Wrapper):
+    """Fold forced actions into one decision, then apply potential shaping.
 
-    Play a forced action at once, and add its reward to the step that follows.
+    Wins zero the potential; time limits retain it for bootstrap values.
     """
+    def __init__(self, env, gamma=1.0, scale=0.0, skip_forced=False):
+        super().__init__(env)
+        self.gamma, self.scale, self.skip_forced = gamma, scale, skip_forced
+
+    def reset(self, **kwargs):
+        result = self.env.reset(**kwargs)
+        self.previous = potential(self.unwrapped, self.scale) if self.scale else 0.0
+        return result
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         forced = 0
-        while not (terminated or truncated):
+        while self.skip_forced and not (terminated or truncated):
             legal = np.flatnonzero(self.env.action_masks())
             if len(legal) != 1:
                 break
             obs, extra, terminated, truncated, info = self.env.step(int(legal[0]))
             reward += extra
             forced += 1
-        return obs, reward, terminated, truncated, {**info, "forced_learner_actions": forced}
-
-    def action_masks(self):
-        return self.env.action_masks()
-
-
-class PotentialReward(gym.Wrapper):
-    """Add a small reward for progress. Use this during training only.
-
-    The value is zero when a player wins, so the shaping cannot change who the
-    winner is. The value stays when the game hits a time limit.
-    """
-
-    def __init__(self, env, gamma, scale):
-        super().__init__(env)
-        self.gamma, self.scale = gamma, scale
-
-    def potential(self):
-        env = self.unwrapped
-        state = env.game.state
-        points = get_actual_victory_points(state, env.learner)
-        # The square root makes a wide spread of resources worth more than a
-        # lot of one resource. The income ignores the robber, so a player
-        # cannot raise this reward by moving the robber.
-        income = player_income(state, env.learner)
-        return self.scale * (points / env.config.target_vp + .2 * np.sqrt(income).sum())
-
-    def reset(self, **kwargs):
-        result = self.env.reset(**kwargs)
-        self.previous = self.potential()
-        return result
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        potential = 0.0 if terminated else self.potential()
-        reward += self.gamma * potential - self.previous
-        self.previous = potential
+        if self.skip_forced:
+            info = {**info, "forced_learner_actions": forced}
+        if self.scale:
+            current = 0.0 if terminated else potential(self.unwrapped, self.scale)
+            reward += self.gamma * current - self.previous
+            self.previous = current
         return obs, reward, terminated, truncated, info
 
     def action_masks(self):
         return self.env.action_masks()
 
-
-def imitate(model, config, samples, seed, epochs, teacher, output, setup_only):
-    """Teach the policy to copy a scripted player before PPO starts.
-
-    Collect demonstrations, then train on them. Skip a forced action, because
-    the policy learns nothing from a choice of one.
-    """
-    from .opponents import opponent_for
-    decide = opponent_for(teacher, config)
-    env = CatanEnv(config, decide)
-    obs, _ = env.reset(seed=seed)
-    observations, masks, actions = [], [], []
-    while len(actions) < samples:
-        mask = env.action_masks()
-        action = decide(env, env.learner)
-        if mask.sum() > 1:
-            observations.append(obs)
-            masks.append(mask)
-            actions.append(action)
-        obs, _, terminated, truncated, _ = env.step(int(action))
-        if terminated or truncated or (setup_only and not env.game.state.is_initial_build_phase):
-            obs, _ = env.reset()
-    env.close()
-    observations = torch.as_tensor(np.asarray(observations), device=model.device)
-    masks = np.asarray(masks)
-    actions = torch.as_tensor(actions, device=model.device)
-    rng = np.random.default_rng(seed)
-    model.policy.set_training_mode(True)
-    history = []
-    for epoch in range(epochs):
-        total_loss, correct = 0.0, 0
-        order = rng.permutation(samples)
-        for start in range(0, samples, 256):
-            indices = order[start:start + 256]
-            distribution = model.policy.get_distribution(observations[indices],
-                                                         action_masks=masks[indices])
-            loss = -distribution.log_prob(actions[indices]).mean()
-            model.policy.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.policy.parameters(), .5)
-            model.policy.optimizer.step()
-            total_loss += float(loss.detach()) * len(indices)
-            correct += int((distribution.distribution.probs.argmax(-1) == actions[indices]).sum())
-        history.append({"epoch": epoch + 1, "loss": total_loss / samples,
-                        "accuracy": correct / samples})
-        if output:
-            with (Path(output) / "imitation.csv").open("w") as stream:
-                writer = csv.DictWriter(stream, fieldnames=history[0])
-                writer.writeheader()
-                writer.writerows(history)
-    model.policy.set_training_mode(False)
-    return {"samples": samples, "epochs": epochs, "last_loss": history[-1]["loss"],
-            "setup_only": setup_only}
-
-
 class Outcomes(BaseCallback):
-    """Count how each game ended, by opponent and by player count."""
+    """Count endings by opponent and player count, including capped-game details."""
 
     def __init__(self):
         super().__init__()
-        self.by_opponent, self.by_players = {}, {}
-        self.truncation_limits = {"max_turns": 0, "max_actions": 0}
+        self.counts = Counter(win=0, loss=0, truncated=0)
+        self.by_opponent = defaultdict(lambda: Counter(win=0, loss=0, truncated=0))
+        self.by_players = defaultdict(lambda: Counter(win=0, loss=0, truncated=0))
+        self.truncation_limits = Counter(max_turns=0, max_actions=0)
         self.forced_actions = 0
         self.capped_games = []
-
-    @property
-    def counts(self):
-        totals = {"win": 0, "loss": 0, "truncated": 0}
-        for counts in self.by_opponent.values():
-            for outcome, count in counts.items():
-                totals[outcome] += count
-        return totals
 
     def _on_step(self):
         for done, info in zip(self.locals["dones"], self.locals["infos"]):
             self.forced_actions += info.get("forced_learner_actions", 0)
             if not done:
                 continue
+            self.counts[info["outcome"]] += 1
             for store, key in ((self.by_opponent, info.get("opponent", "unknown")),
                                (self.by_players, info.get("players", 2))):
-                counts = store.setdefault(key, {"win": 0, "loss": 0, "truncated": 0})
-                counts[info["outcome"]] += 1
+                store[key][info["outcome"]] += 1
             if info["outcome"] == "truncated":
                 self.capped_games.append({k: info[k] for k in
                                           ("opponent", "seed", "seat", "turns", "actions",
                                            "learner_vp", "opponent_vp", "truncation_limits")
                                           if k in info})
-            for limit in info["truncation_limits"]:
-                self.truncation_limits[limit] += 1
+            self.truncation_limits.update(info["truncation_limits"])
         return True
 
     def _on_rollout_end(self):
-        for outcome, count in self.counts.items():
-            self.logger.record("games/" + outcome, count)
-        for name, counts in self.by_opponent.items():
-            self.logger.record("opponents/" + name + "/win_rate", counts["win"] / sum(counts.values()))
-        for limit, count in self.truncation_limits.items():
-            self.logger.record("games/" + limit, count)
-        for players, counts in self.by_players.items():
-            self.logger.record(f"players/{players}/win_rate", counts["win"] / sum(counts.values()))
-
+        for name, count in {**self.counts, **self.truncation_limits}.items():
+            self.logger.record("games/" + name, count)
+        for prefix, store in (("opponents", self.by_opponent), ("players", self.by_players)):
+            for name, counts in store.items():
+                self.logger.record(f"{prefix}/{name}/win_rate", counts["win"] / counts.total())
 
 def train(output="runs/ppo", steps=100_000, seed=0, opponent="random",
           config=None, resume=None, envs=4, rollout=512, batch=256,
-          gamma=None, shaping=0.0, imitation=0, imitation_epochs=10,
-          teacher="greedy", policy="mlp", gae_lambda=None, entropy=None,
-          skip_forced=False, league=None, learning_rate=None, imitation_setup=False):
-    """Train one model and write it, its rules and its metrics to output.
-
-    The opponents do not change during a run. Use resume to raise the victory
-    target between runs.
-    """
-    from .opponents import SCRIPTED, opponent_for
+          gamma=None, shaping=0.0, gae_lambda=None, entropy=None,
+          skip_forced=False, league=None, learning_rate=None,
+          transfer=None, league_floor=.25, checkpoint_every=0):
+    """Train and save weights, rules and metrics. Resume keeps optimiser state;
+    transfer grows the network with silent new inputs and a fresh optimiser."""
+    from .opponents import LIBRARY, SCRIPTED, opponent_for
     config = config or Config()
     if steps < 0 or min(envs, rollout, batch) < 1 or envs * rollout < 2:
         raise ValueError("steps cannot be negative, and the sizes must be positive")
@@ -310,33 +287,30 @@ def train(output="runs/ppo", steps=100_000, seed=0, opponent="random",
     if shaping < 0 or (entropy is not None and entropy < 0) or (gae_lambda is not None
                                                                 and not 0 <= gae_lambda <= 1):
         raise ValueError("shaping and entropy cannot be negative, and gae_lambda must be 0 to 1")
-    if policy not in ("mlp", "actions", "project"):
-        raise ValueError("policy must be mlp, actions or project")
-    if config.multiplayer and policy != "mlp":
-        raise ValueError("The multiplayer format uses the mlp policy")
-    if imitation_setup and not imitation:
-        raise ValueError("imitation_setup needs imitation samples")
+    if resume and transfer:
+        raise ValueError("Use resume or transfer, not both")
+    if checkpoint_every < 0:
+        raise ValueError("checkpoint_every cannot be negative")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    torch.set_num_threads(1)
+    torch.set_num_threads(int(os.environ.get("RLCATAN_THREADS", 1)))
     np.random.seed(seed)
     torch.manual_seed(seed)
     opponent_name = str(opponent)
     if league:
-        opponent = League(league, config)
+        opponent = League(league, config, league_floor)
     elif opponent not in ("random", "greedy"):
         opponent = opponent_for(opponent, config)
     if resume:
-        model, _ = load_policy(resume)
+        # A resumed run may collect and batch differently from the saved one.
+        model, _ = load_policy(resume, n_steps=rollout, batch_size=batch, n_envs=envs)
     learning_rate = (learning_rate if learning_rate is not None
                      else float(model.lr_schedule(1)) if resume else 3e-4)
     gamma = gamma if gamma is not None else model.gamma if resume else .995
 
     def make_env():
         env = CatanEnv(config, opponent)
-        if skip_forced:
-            env = DecisionSteps(env)
-        return PotentialReward(env, gamma, shaping) if shaping else env
+        return TrainingEnv(env, gamma, shaping, skip_forced) if skip_forced or shaping else env
 
     # One process runs every game. Profile before you pay for more processes.
     vec = DummyVecEnv([make_env for _ in range(envs)])
@@ -346,8 +320,6 @@ def train(output="runs/ppo", steps=100_000, seed=0, opponent="random",
     logger = None
     try:
         if resume:
-            if model.n_steps != rollout or model.batch_size != batch or model.n_envs != envs:
-                raise ValueError("resume needs the saved envs, rollout and batch sizes")
             model.gamma = model.rollout_buffer.gamma = gamma
             if gae_lambda is not None:
                 model.gae_lambda = model.rollout_buffer.gae_lambda = gae_lambda
@@ -359,49 +331,50 @@ def train(output="runs/ppo", steps=100_000, seed=0, opponent="random",
             model.set_env(vec)
             model.set_random_seed(seed)
         else:
-            from .policies import ActionFeaturePolicy, PlayerFeatures, ProjectPolicy
-            classes = {"actions": ActionFeaturePolicy, "project": ProjectPolicy}
-            policy_kwargs = {"net_arch": {"pi": [128, 128], "vf": [128, 128]}}
-            if config.multiplayer:
-                # Format 4 always reads the player blocks.
-                policy_kwargs["features_extractor_class"] = PlayerFeatures
-            model = MaskablePPO(classes.get(policy, "MlpPolicy"), vec, learning_rate=learning_rate,
+            from .policies import AttentionPolicy
+            # A counted run also scores each settlement by its port.
+            policy_kwargs = {"net_arch": {"pi": [128, 128], "vf": [128, 128]},
+                             "counted": config.counted or config.seats,
+                             "ports": config.counted or config.seats,
+                             "seats": config.seats, "trading": config.trading}
+            model = MaskablePPO(AttentionPolicy, vec, learning_rate=learning_rate,
                                 n_steps=rollout, batch_size=batch, n_epochs=4, gamma=gamma,
                                 gae_lambda=.95 if gae_lambda is None else gae_lambda,
                                 ent_coef=.01 if entropy is None else entropy, target_kl=0.03,
                                 seed=seed, device="cpu", policy_kwargs=policy_kwargs)
-        # Imitation uses the optimiser directly, before PPO sets its own rate.
+            if transfer:
+                source, _ = load_policy(transfer)
+                transfer_weights(model.policy, source.policy.state_dict())
+                if config.trading and not getattr(source.policy, "trading", False):
+                    model.policy.prime_trading()
+                # Loading restores the seed of the source. This run keeps its own.
+                model.set_random_seed(seed)
         for group in model.policy.optimizer.param_groups:
             group["lr"] = learning_rate
         source_dir = output / "source"
         source_dir.mkdir()
         for name, data in SOURCE_FILES.items():
             (source_dir / name).write_bytes(data)
-        # requirements.txt sits beside the package. It is absent once installed.
-        requirements = Path(__file__).resolve().parent.parent / "requirements.txt"
-        if requirements.exists():
-            shutil.copy2(requirements, source_dir / requirements.name)
-        saved = [p for p in (resume, *(league or []), opponent_name,
-                             teacher if imitation else None)
-                 if p and str(p) not in SCRIPTED]
-        metadata = {"format": 4 if config.multiplayer else 3, "game": asdict(config), "seed": seed,
+        (source_dir / "requirements.txt").write_text("\n".join(requires("rlcatan") or []) + "\n")
+        saved = [p for p in (resume, transfer, *(league or []), opponent_name)
+                 if p and str(p) not in SCRIPTED and str(p) not in LIBRARY]
+        metadata = {"format": 5 if config.seats else 3, "game": asdict(config), "seed": seed,
                     "opponent": "+".join(map(str, league)) if league else opponent_name,
                     "requested_steps": steps,
                     "envs": envs, "rollout": rollout, "batch": batch,
                     "gamma": gamma, "gae_lambda": model.gae_lambda, "entropy": model.ent_coef,
-                    "status": "imitation" if imitation else "training",
-                    "imitation_requested": {"samples": imitation, "epochs": imitation_epochs,
-                                            "setup_only": imitation_setup},
+                    "status": "training",
                     "ppo_epochs": model.n_epochs, "target_kl": model.target_kl,
                     "policy_class": type(model.policy).__name__,
                     "policy_kwargs": str(model.policy_kwargs),
                     "shaping": shaping, "shaping_version": "resource-income-sqrt-v1",
-                    "imitation": None, "teacher": teacher,
+                    "league_weighting": "inverse-win-rate-v1", "league_floor": league_floor,
                     "skip_forced": skip_forced, "learning_rate": learning_rate,
                     "league": list(map(str, league or [])),
                     "dependencies": [{"path": str(model_path(p)), "sha256": file_sha256(model_path(p))}
                                      for p in dict.fromkeys(saved)],
-                    "resume": str(resume) if resume else None, **runtime()}
+                    "resume": str(resume) if resume else None,
+                    "transfer": str(transfer) if transfer else None, **runtime()}
 
         def save_metadata():
             (output / "run.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -409,15 +382,15 @@ def train(output="runs/ppo", steps=100_000, seed=0, opponent="random",
         logger = configure(str(output), ["csv"])
         model.set_logger(logger)
         save_metadata()
-        if imitation:
-            metadata["imitation"] = imitate(model, config, imitation, seed, imitation_epochs,
-                                            teacher, output, imitation_setup)
-        metadata["status"] = "training"
-        save_metadata()
         model.save(output / "initial.zip")
         before = model.num_timesteps
         if steps:
-            model.learn(total_timesteps=steps, callback=callback,
+            callbacks = [callback]
+            if checkpoint_every:
+                # Each checkpoint loads with the run.json beside it.
+                from stable_baselines3.common.callbacks import CheckpointCallback
+                callbacks.append(CheckpointCallback(max(1, checkpoint_every // envs), str(output), "model"))
+            model.learn(total_timesteps=steps, callback=callbacks,
                         reset_num_timesteps=not bool(resume))
         if not all(torch.isfinite(p).all() for p in model.policy.parameters()):
             raise RuntimeError("Training produced parameters that are not finite")
@@ -446,53 +419,46 @@ def train(output="runs/ppo", steps=100_000, seed=0, opponent="random",
             logger.close()
         vec.close()
 
-
 def positive(text):
     value = int(text)
     if value < 1:
         raise argparse.ArgumentTypeError("must be 1 or more")
     return value
 
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default="runs/ppo")
-    parser.add_argument("--steps", type=int, default=100_000)
-    parser.add_argument("--seed", type=int, default=0)
+    for name, default in (("steps", 100_000), ("seed", 0), ("target-vp", 6)):
+        parser.add_argument("--" + name, type=int, default=default)
+    for name, default in (("max-turns", 300), ("max-actions", 2000),
+                          ("envs", 4), ("rollout", 512), ("batch", 256)):
+        parser.add_argument("--" + name, type=positive, default=default)
+    for name in ("gamma", "gae-lambda", "entropy", "learning-rate"):
+        parser.add_argument("--" + name, type=float)
+    for name, help_text in (("counted", "Observe counted hands and roads' outcomes"),
+                            ("seats", "Seat format: two to four players, counted, attention policy"),
+                            ("trading", "Player to player trades"),
+                            ("skip-forced", "Train on real choices only")):
+        parser.add_argument("--" + name, action="store_true", help=help_text)
     parser.add_argument("--opponent", default="random", help="random, greedy or a saved run")
-    parser.add_argument("--target-vp", type=int, default=6)
-    parser.add_argument("--max-turns", type=positive, default=300)
-    parser.add_argument("--max-actions", type=positive, default=2000)
     parser.add_argument("--players", type=int, choices=(2, 3, 4), default=2)
-    parser.add_argument("--multiplayer", action="store_true",
-                        help="Use format 4, even for two players")
     parser.add_argument("--player-counts", type=int, nargs="+", default=(),
                         help="Pick a count each game; repeat a count to make it more likely")
+    parser.add_argument("--offers", type=int, default=2, help="Offers a player may make each turn")
     parser.add_argument("--resume", help="A saved run; the rules may change for a curriculum")
-    parser.add_argument("--envs", type=positive, default=4)
-    parser.add_argument("--rollout", type=positive, default=512)
-    parser.add_argument("--batch", type=positive, default=256)
-    parser.add_argument("--gamma", type=float)
+    parser.add_argument("--transfer", help="A saved run whose weights start a new network")
     parser.add_argument("--shaping", type=float, default=0.0)
-    parser.add_argument("--imitation", type=int, default=0, help="Demonstrations before PPO")
-    parser.add_argument("--imitation-epochs", type=positive, default=10)
-    parser.add_argument("--imitation-setup", action="store_true",
-                        help="Copy the opening placements only")
-    parser.add_argument("--teacher", default="greedy", help="A scripted player or a saved run")
-    parser.add_argument("--policy", choices=("mlp", "actions", "project"), default="mlp")
-    parser.add_argument("--gae-lambda", type=float)
-    parser.add_argument("--entropy", type=float)
-    parser.add_argument("--skip-forced", action="store_true",
-                        help="Train on real choices only")
     parser.add_argument("--league", nargs="+", help="Scripted players and saved runs")
-    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--league-floor", type=float, default=.25,
+                        help="Least weight of a beaten league member; large means uniform")
+    parser.add_argument("--checkpoint-every", type=int, default=0,
+                        help="Also save the model every this many steps")
     args = vars(parser.parse_args())
     args["config"] = Config(**{k: args.pop(k) for k in
                                ("target_vp", "max_turns", "max_actions", "players",
-                                "multiplayer", "player_counts")})
+                                "player_counts", "counted", "seats", "trading", "offers")})
     _, result = train(**args)
     print(json.dumps(result, indent=2))
-
 
 if __name__ == "__main__":
     main()

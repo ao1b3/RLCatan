@@ -1,12 +1,7 @@
-"""Measure how well a model plays, and how fast the code runs.
-
-Every seat plays the same board, so a lucky board helps nobody. The game, the
-observation and the network are timed apart.
-"""
+"""Evaluate every seat of each board seed; time game, encoding and network separately."""
 import argparse
 import json
 import statistics
-import resource
 import sys
 import time
 import tracemalloc
@@ -18,30 +13,59 @@ import numpy as np
 import torch
 from catanatron.state_functions import player_key
 
-from .game import CatanEnv, Config
+from catanatron.models.enums import ActionType as A
+
+from .game import CatanEnv, Config, winner
 from .opponents import choose_action, opponent_for
-from .training import League, file_sha256, load_policy, runtime
+from .training import League, file_sha256, load_policy, potential, runtime
 
 BASELINES = ("random", "greedy", "builder", "expansion", "development")
-STYLES = ("greedy", "builder", "expansion", "development", "mixed")
+STYLES = ("builder", "planner", "value", "mixed")
 _EVALUATOR_SHA = file_sha256(__file__)
 
+def select(env, policy, obs, lookahead=0):
+    """Select a named player or model action; optionally rank top choices by critic.
 
-def select(env, policy, obs):
-    """Return the action of one player. The player may be a name or a model."""
+    Roll/end-turn retain current value, winning moves win, and shaping is undone."""
+    if lookahead < 0:
+        raise ValueError("lookahead cannot be negative")
     if isinstance(policy, str):
         return (choose_action(env, kind=policy) if policy in ("random", "greedy")
                 else opponent_for(policy, env.config)(env, env.learner))
-    action, _ = policy.predict(obs, deterministic=True, action_masks=env.action_masks())
-    return int(action)
-
+    if not lookahead:
+        action, _ = policy.predict(obs, deterministic=True, action_masks=env.action_masks())
+        return int(action)
+    policy.policy.set_training_mode(False)
+    with torch.no_grad():
+        tensor, _ = policy.policy.obs_to_tensor(obs)
+        logits = policy.policy.get_distribution(tensor, action_masks=env.action_masks()).distribution.logits[0]
+        candidates = logits.topk(min(lookahead, len(env._legal))).indices.tolist()
+        if len(candidates) == 1:
+            return candidates[0]
+        scale = getattr(policy, "shaping", 0.0)
+        values, game = {}, env.game
+        now = float(policy.policy.predict_values(tensor)) + potential(env, scale)
+        for action in candidates:
+            move = env._legal[action]
+            if move.action_type in (A.END_TURN, A.ROLL):
+                values[action] = now
+                continue
+            env.game = game.copy()
+            try:
+                env.game.execute(move)
+                if winner(env.game) == env.learner:
+                    values[action] = float("inf")
+                elif env.game.state.current_color() == env.learner:
+                    values[action] = float(policy.policy.predict_values(
+                        policy.policy.obs_to_tensor(env.observe())[0])) + potential(env, scale)
+                else:
+                    values[action] = now
+            finally:
+                env.game = game
+    return max(candidates, key=lambda action: (values[action], float(logits[action])))
 
 def select_batch(policy, active):
-    """Return one action for each game that is running.
-
-    One batch is faster than one call per game. A different batch size can move
-    the last digits of a score, so score a near tie one game at a time.
-    """
+    """Batch inference, rescoring near ties singly to keep batch sizes comparable."""
     policy.policy.set_training_mode(False)
     with torch.no_grad():
         observations, _ = policy.policy.obs_to_tensor(np.stack([game[1] for game in active]))
@@ -55,12 +79,8 @@ def select_batch(policy, active):
         actions[index] = select(env, policy, obs)
     return actions
 
-
 def paired_interval(values, seed=0):
-    """Return a 95 percent interval. Resample whole boards, not single seats.
-
-    The seats of one board share the same tiles, so they are not independent.
-    """
+    """Bootstrap a 95% interval by whole boards: seats on one board are correlated."""
     values = np.asarray(values, dtype=float)
     if len(values) < 2:
         return None
@@ -68,17 +88,19 @@ def paired_interval(values, seed=0):
     estimates = [rng.choice(values, len(values), replace=True).mean() for _ in range(2000)]
     return np.quantile(estimates, [0.025, 0.975]).tolist()
 
-
-def evaluate(policy="random", opponent="greedy", config=None, pairs=100, seed=100_000, envs=1):
-    """Play every seat of each board seed, and report how the games ended."""
+def evaluate(policy="random", opponent="greedy", config=None, pairs=100, seed=100_000, envs=1,
+             lookahead=0):
+    """Play every seat of each board seed and report outcomes."""
     if pairs < 1 or envs < 1:
         raise ValueError("pairs and envs must be positive")
+    if lookahead < 0:
+        raise ValueError("lookahead cannot be negative")
     config = config or Config()
     # Evaluation fixes the player count and rotates every seat of a board.
     config = replace(config, player_counts=())
     players = config.players
     if opponent == "mixed":
-        opponent = League(["greedy", "builder", "expansion", "development"], config)
+        opponent = League(["greedy", "builder", "expansion", "development"], config, adaptive=False)
     elif isinstance(opponent, str) and opponent not in ("random", "greedy"):
         opponent = opponent_for(opponent, config)
     rows = []
@@ -94,8 +116,8 @@ def evaluate(policy="random", opponent="greedy", config=None, pairs=100, seed=10
 
     active = [start(CatanEnv(config, opponent)) for _ in range(min(envs, players * pairs))]
     while active:
-        if envs == 1 or isinstance(policy, str):
-            actions = [select(env, policy, obs) for env, obs, _, _ in active]
+        if envs == 1 or lookahead or isinstance(policy, str):
+            actions = [select(env, policy, obs, lookahead) for env, obs, _, _ in active]
         else:
             actions = select_batch(policy, active)
         remaining = []
@@ -126,7 +148,7 @@ def evaluate(policy="random", opponent="greedy", config=None, pairs=100, seed=10
     pair_wins = np.array(wins).reshape(-1, players).mean(axis=1)
     elapsed = time.perf_counter() - started
     return {"game": asdict(config), "seed_start": seed, "pairs": pairs,
-            "games": len(rows), "evaluation_envs": envs,
+            "games": len(rows), "evaluation_envs": envs, "lookahead": lookahead,
             "evaluation_source_sha256": _EVALUATOR_SHA,
             "outcomes": {kind: sum(row["outcome"] == kind for row in rows)
                          for kind in ("win", "loss", "truncated")},
@@ -142,9 +164,8 @@ def evaluate(policy="random", opponent="greedy", config=None, pairs=100, seed=10
             "seconds": elapsed, "games_per_second": len(rows) / elapsed,
             "rows": rows}
 
-
 def compare(policy, opponent="greedy", config=None, pairs=100, seed=100_000, reference=None, envs=1):
-    """Play the model and the baselines on the same seeds, and report the gap."""
+    """Compare model and baselines on matching seeds with paired board intervals."""
     policies = {"random": "random", "greedy": "greedy", "model": policy}
     if reference is not None:
         policies["initial"] = reference
@@ -159,13 +180,13 @@ def compare(policy, opponent="greedy", config=None, pairs=100, seed=100_000, ref
             "95pct_paired_bootstrap": paired_interval(differences)}
     return reports
 
-
-def speed(steps=5000, repeats=3, policy=None):
-    """Time the game, the observation, the mask and the network apart."""
+def speed(steps=5000, repeats=3, policy=None, config=None):
+    """Time the game, observation, mask and network separately."""
+    import resource
     if min(steps, repeats) < 1:
         raise ValueError("steps and repeats must be positive")
     rates, encoding, masks, inference = [], [], [], []
-    env = CatanEnv()
+    env = CatanEnv(config or Config())
     for repeat in range(repeats):
         obs, _ = env.reset(seed=repeat)
         if policy is not None:
@@ -215,12 +236,12 @@ def speed(steps=5000, repeats=3, policy=None):
     env.close()
     return result
 
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", help="A saved run; leave out to measure a baseline")
     parser.add_argument("--opponent", default="greedy")
     parser.add_argument("--players", type=int, choices=(2, 3, 4), help="Fixed player count")
+    parser.add_argument("--seats", action="store_true", help="Play a baseline in the seat format")
     parser.add_argument("--suite", action="store_true",
                         help="Play 2, 3 and 4 players against each style and a mixed league")
     parser.add_argument("--policy", choices=BASELINES, default="random")
@@ -228,30 +249,40 @@ def main():
     parser.add_argument("--eval-envs", type=int, default=16,
                         help="Play this many games at once; 1 scores one game at a time")
     parser.add_argument("--seed", type=int, default=100_000)
+    parser.add_argument("--offers", type=int,
+                        help="Offers each player may make per turn; 0 scores the same bot with "
+                             "trading switched off, on the same boards")
+    parser.add_argument("--lookahead", type=int, default=0,
+                        help="Re-rank this many top policy choices by the critic")
     parser.add_argument("--speed", action="store_true")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     torch.set_num_threads(1)
-    model, config = load_policy(args.model) if args.model else (args.policy, Config())
+    model, config = (load_policy(args.model) if args.model
+                     else (args.policy, Config(seats=args.seats or args.suite or (args.players or 2) != 2)))
     if args.players:
-        config = replace(config, players=args.players, player_counts=(),
-                         multiplayer=config.multiplayer or (not args.model and args.players != 2))
+        config = replace(config, players=args.players, player_counts=())
+    if args.offers is not None:
+        if not config.trading:
+            parser.error("--offers needs a trading model")
+        config = replace(config, offers=args.offers)
     if args.compare and not args.model:
         parser.error("--compare needs --model")
+    if args.lookahead and (args.speed or args.compare):
+        parser.error("--lookahead cannot be used with --speed or --compare")
     if args.suite:
         if args.speed or args.compare:
             parser.error("--suite cannot be used with --speed or --compare")
-        if args.model and not config.multiplayer:
-            parser.error("--suite needs a multiplayer model")
+        if args.model and not config.relative_actions:
+            parser.error("--suite needs a seat model")
         result = {}
         for players in (2, 3, 4):
             for style in STYLES:
                 key = f"{players}p-{style}"
                 result[key] = evaluate(model, style,
-                                       replace(config, players=players, multiplayer=True,
-                                               player_counts=()),
-                                       args.pairs, args.seed, args.eval_envs)
+                                       replace(config, players=players, player_counts=()),
+                                       args.pairs, args.seed, args.eval_envs, args.lookahead)
                 print(f'{key}: {result[key]["win_rate_all_games"]:.1%}, '
                       f'{result[key]["outcomes"]}', flush=True)
     elif args.compare and not args.speed:
@@ -260,9 +291,10 @@ def main():
         reference = load_policy(initial)[0] if initial.exists() else None
         result = compare(model, args.opponent, config, args.pairs, args.seed, reference, args.eval_envs)
     elif args.speed:
-        result = speed(policy=model if args.model else None)
+        result = speed(policy=model if args.model else None, config=config)
     else:
-        result = evaluate(model, args.opponent, config, args.pairs, args.seed, args.eval_envs)
+        result = evaluate(model, args.opponent, config, args.pairs, args.seed, args.eval_envs,
+                          args.lookahead)
     payload = json.dumps(result, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -273,7 +305,6 @@ def main():
     else:
         result = {k: v for k, v in result.items() if k != "rows"}
     print(json.dumps(result, indent=2))
-
 
 if __name__ == "__main__":
     main()
