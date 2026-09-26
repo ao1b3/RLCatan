@@ -7,7 +7,7 @@ name = "rlcatan"
 version = "0.1.0"
 description = "Train and evaluate masked-PPO Settlers of Catan agents on Catanatron."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "catanatron @ git+https://github.com/bcollazo/catanatron.git@ecf931181b9a65bb4116a2153fb78c16f1438e00",
     "sb3-contrib==2.9.0",

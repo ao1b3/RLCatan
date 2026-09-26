@@ -1,55 +1,66 @@
 # RLCatan
 
-Train and evaluate Catan bots with masked PPO, a board transformer, and
-[Catanatron](https://github.com/bcollazo/catanatron) as the game engine.
+Train and evaluate masked-PPO Settlers of Catan agents on top of
+[Catanatron](https://github.com/bcollazo/catanatron), instead of trying to simulate internally...
 
-## Setup
+This repository holds the environment, training, and evaluation code. The
+browser interface for playing against a trained model is developed separately
+and depends on this package.
 
-Python 3.12+ (checks run on 3.13):
+## Install
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -e .
-.venv/bin/python -m rlcatan.training --output runs/first --seats --trading \
-  --players 4 --target-vp 10 --steps 100000 --league builder planner
-.venv/bin/python -m rlcatan.benchmark --model runs/first --suite --pairs 100 --seed 9500000
 ```
 
-## Method
-
-- Featurized board state, own hand, public information, and approximate card counting.
-- Three attention layers, width 64, four heads; shared action scorer and value head.
-- Maskable PPO with potential-based reward shaping and scripted/frozen opponent leagues.
-- Evaluation across starting seats and fixed boards, with board-level confidence intervals.
-
-[Methodology](METHODOLOGY.md) explains the representations, architecture, and
-training choices, with a diagram of the path from game state to decisions.
-
-## Play
-
-The browser demo supports two to four players and optional negotiation.
-
-Weights are local artifacts, not included in a clone. Keep each `model.zip`
-with its `run.json`; load only checkpoints you trust. Training produces both.
-The separately developed sibling `RLCatan-play` provides
-browser play; with both projects and the checkpoints available:
+## Train
 
 ```sh
-cd ../RLCatan-play
-../RLCatan/.venv/bin/python -m pip install -r requirements-play.txt
-../RLCatan/.venv/bin/python play.py
+.venv/bin/python -m rlcatan.training --output runs/new --policy project --steps 100000
+.venv/bin/python -m rlcatan.benchmark --model runs/new --pairs 100
 ```
 
-## Code and checks
+The `rlcatan-train` and `rlcatan-benchmark` console scripts are equivalent.
 
-`rlcatan/`: `game.py` (environment), `policies.py` (network), `opponents.py`
-(opponents), `training.py` (PPO), `benchmark.py` (evaluation).
-`tools/habits.py` measures openings, building choices, robber use, and trades.
+`project` is the two-player policy. `actions` is the compact two-player action
+policy. `mlp` is the baseline. Add `--multiplayer` to train on two to four
+players; that format always reads the per-player blocks, so it uses `mlp`.
+
+Use `--shaping .5` to reward progress toward victory and balanced resource
+production during training. Evaluation and browser play use the original game
+rewards. To continue project-ten:
 
 ```sh
-.venv/bin/python test_rlcatan.py
-.venv/bin/python test_rules.py
+.venv/bin/python -m rlcatan.training --output runs/project-coverage --resume runs/project-ten \
+  --target-vp 10 --envs 8 --rollout 128 --batch 256 --steps 131072 --seed 8300000 \
+  --league builder planner-available expansion development runs/project-ten \
+  --shaping .5 --skip-forced --gamma .999 --gae-lambda .99 --learning-rate .0001 --entropy .01
 ```
 
-Public demo hosting, checkpoint distribution, and a project license remain
-release tasks. Earlier notebook code is on `legacy-rlmodels`.
+Use a fresh output directory for each run. Compare candidates on the same
+evaluation seeds. `stalled_games` counts games ending with two settlements and
+no cities; `two_vp_games` counts games ending at two or fewer actual victory
+points. Development-card strategies can win without expanding, so inspect these
+counts alongside wins.
+
+`--imitation 4000 --imitation-epochs 5 --imitation-setup --teacher planner-available`
+trains on opening placements before PPO. Omit `--imitation-setup` to imitate
+full games. Opening practice updates shared network weights, so evaluate full
+games afterward.
+
+## Checkpoints
+
+Each run directory keeps `model.zip` beside the `run.json` that records its
+rules, seeds, and source hashes; the two must stay together. Runs trained
+before the modules moved into the `rlcatan` package pickled their policy
+classes under the old top-level names. `LEGACY_MODULES` in
+`rlcatan.training` maps each old name to the file that now holds the class, so
+those checkpoints still load.
+
+Generated runs and models are ignored by Git.
+
+## History
+
+The original notebook-and-`RLmodels` project that preceded this rewrite is kept
+on the `legacy-rlmodels` branch and the `legacy-rlmodels-final` tag.
