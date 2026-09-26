@@ -8,3 +8,9 @@ models/
 *.egg-info/
 build/
 dist/
+logs/
+*.zip
+*.pt
+*.pth
+*.safetensors
+.model-registry/

@@ -1,13 +1,13 @@
 # RLCatan
 
-Train and evaluate masked-PPO Settlers of Catan agents on top of
-[Catanatron](https://github.com/bcollazo/catanatron), instead of trying to simulate internally...
-
-This repository holds the environment, training, and evaluation code. The
-browser interface for playing against a trained model is developed separately
-and depends on this package.
+Train and evaluate Catan agents with masked PPO, using
+[Catanatron](https://github.com/bcollazo/catanatron) as the game engine.
+Supports two to four players, approximate opponent card counting, and optional
+player trading. Decisions use a single network pass without tree search.
 
 ## Install
+
+Python 3.12+:
 
 ```sh
 python3 -m venv .venv
@@ -17,50 +17,53 @@ python3 -m venv .venv
 ## Train
 
 ```sh
-.venv/bin/python -m rlcatan.training --output runs/new --policy project --steps 100000
-.venv/bin/python -m rlcatan.benchmark --model runs/new --pairs 100
+.venv/bin/python -m rlcatan.training --output runs/new --seats --trading \
+  --players 4 --target-vp 10 --max-turns 600 --max-actions 4000 \
+  --steps 100000 --league builder planner --shaping .2 --skip-forced
+.venv/bin/python -m rlcatan.benchmark --model runs/new --suite --pairs 100 --seed 9500000
 ```
 
-The `rlcatan-train` and `rlcatan-benchmark` console scripts are equivalent.
+Use a fresh output directory. `--resume runs/previous` continues training;
+`--transfer runs/previous` initializes a compatible expanded representation.
+`--player-counts 2 3 4 4` mixes game sizes. Opponents can be scripted players or
+saved runs. The `rlcatan-train` and `rlcatan-benchmark` commands are equivalent.
 
-`project` is the two-player policy. `actions` is the compact two-player action
-policy. `mlp` is the baseline. Add `--multiplayer` to train on two to four
-players; that format always reads the per-player blocks, so it uses `mlp`.
+## Architecture
 
-Use `--shaping .5` to reward progress toward victory and balanced resource
-production during training. Evaluation and browser play use the original game
-rewards. To continue project-ten:
+Board, hand, public player state, and estimated opponent hands become structured
+features. Separate projections turn intersections, tiles, players, and game
+context into tokens. Three transformer blocks share information through four
+attention heads, with board adjacency encoded as attention biases.
 
-```sh
-.venv/bin/python -m rlcatan.training --output runs/project-coverage --resume runs/project-ten \
-  --target-vp 10 --envs 8 --rollout 128 --batch 256 --steps 131072 --seed 8300000 \
-  --league builder planner-available expansion development runs/project-ten \
-  --shaping .5 --skip-forced --gamma .999 --gae-lambda .99 --learning-rate .0001 --entropy .01
-```
+A shared scorer ranks complete candidate actions; illegal choices are masked.
+A separate value branch estimates return for PPO. Training uses potential-based
+reward shaping, randomized starting seats, and scripted/frozen-policy leagues.
+The full trading configuration has 1,698 observation values, 78 tokens of width
+64, 436 candidate actions, and 198,280 trainable parameters.
 
-Use a fresh output directory for each run. Compare candidates on the same
-evaluation seeds. `stalled_games` counts games ending with two settlements and
-no cities; `two_vp_games` counts games ending at two or fewer actual victory
-points. Development-card strategies can win without expanding, so inspect these
-counts alongside wins.
+![Full multiplayer and trading architecture](docs/architecture-detailed.png)
 
-`--imitation 4000 --imitation-epochs 5 --imitation-setup --teacher planner-available`
-trains on opening placements before PPO. Omit `--imitation-setup` to imitate
-full games. Opening practice updates shared network weights, so evaluate full
-games afterward.
+## Results
+
+The saved trading checkpoint (`trade-c`) won **80.0%** against the mixed scripted
+league, **64.25%** against builder, **43.0%** against planner, and **47.75%** against
+Catanatron's value player in four-player games. Each matchup used 100 boards,
+all four starting seats (400 games), a 10-point target, and limits of 600 turns
+and 4,000 actions. No games reached those limits. The mixed-league 95% interval
+was 75.25–84.5%, bootstrapped by board. These are checkpoint results, not a
+performance guarantee for the short training example above.
+
+[Recorded results and checkpoint hash](docs/results.json) include all two-,
+three-, and four-player matchups. The mixed league samples greedy, builder,
+expansion, and development opponents uniformly per seat.
 
 ## Checkpoints
 
-Each run directory keeps `model.zip` beside the `run.json` that records its
-rules, seeds, and source hashes; the two must stay together. Runs trained
-before the modules moved into the `rlcatan` package pickled their policy
-classes under the old top-level names. `LEGACY_MODULES` in
-`rlcatan.training` maps each old name to the file that now holds the class, so
-those checkpoints still load.
-
-Generated runs and models are ignored by Git.
+Keep each `model.zip` beside its `run.json`, which records rules, seeds,
+dependencies, and source hashes. Weights and training runs are not included in
+this repository. Load only trusted checkpoints. Browser play is developed
+separately in `RLCatan-play` and uses this package.
 
 ## History
 
-The original notebook-and-`RLmodels` project that preceded this rewrite is kept
-on the `legacy-rlmodels` branch and the `legacy-rlmodels-final` tag.
+The earlier notebook project is preserved on `legacy-rlmodels`.
