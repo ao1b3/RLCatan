@@ -41,21 +41,16 @@ reward shaping, randomized starting seats, and scripted/frozen-policy leagues.
 The full trading configuration has 1,698 observation values, 78 tokens of width
 64, 436 candidate actions, and 198,280 trainable parameters.
 
-![Full multiplayer and trading architecture](docs/architecture-detailed.png)
-
 ## Results
 
-The saved trading checkpoint (`trade-c`) won **80.0%** against the mixed scripted
-league, **64.25%** against builder, **43.0%** against planner, and **47.75%** against
-Catanatron's value player in four-player games. Each matchup used 100 boards,
-all four starting seats (400 games), a 10-point target, and limits of 600 turns
-and 4,000 actions. No games reached those limits. The mixed-league 95% interval
-was 75.25–84.5%, bootstrapped by board. These are checkpoint results, not a
-performance guarantee for the short training example above.
+After **1.05 million additional PPO steps**, the policy with expanded card-count
+and action features won **56.75%** against its frozen predecessor over 400 games
+(200 boards, both starting seats; 95% interval: 52–61.5%). A same-budget control
+without those added features won 51.25% against the same predecessor.
+This measures progress against an earlier learned policy; one training seed and
+selection among several variants limit conclusions about the feature changes.
 
-[Recorded results and checkpoint hash](docs/results.json) include all two-,
-three-, and four-player matchups. The mixed league samples greedy, builder,
-expansion, and development opponents uniformly per seat.
+[Recorded learning results](docs/results.json).
 
 ## Checkpoints
 
