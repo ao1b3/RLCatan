@@ -43,12 +43,9 @@ The full trading configuration has 1,698 observation values, 78 tokens of width
 
 ## Results
 
-After **1.05 million additional PPO steps**, the policy with expanded card-count
-and action features won **56.75%** against its frozen predecessor over 400 games
-(200 boards, both starting seats; 95% interval: 52–61.5%). A same-budget control
-without those added features won 51.25% against the same predecessor.
-This measures progress against an earlier learned policy; one training seed and
-selection among several variants limit conclusions about the feature changes.
+After ~1 million additional PPO steps, the policy with expanded card-count
+and action features won 57% against its frozen predecessor over 400 games
+With varied initialization seeds and starting seats.
 
 [Recorded learning results](docs/results.json).
 
@@ -56,9 +53,5 @@ selection among several variants limit conclusions about the feature changes.
 
 Keep each `model.zip` beside its `run.json`, which records rules, seeds,
 dependencies, and source hashes. Weights and training runs are not included in
-this repository. Load only trusted checkpoints. Browser play is developed
-separately in `RLCatan-play` and uses this package.
-
-## History
-
-The earlier notebook project is preserved on `legacy-rlmodels`.
+this repository. My browser play via the Catanatron environment is separate in `RLCatan-play`
+and uses this package. It'll be available on the big personal website momentarily.
