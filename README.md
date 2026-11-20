@@ -43,9 +43,7 @@ The full trading configuration has 1,698 observation values, 78 tokens of width
 
 ## Results
 
-After ~1 million additional PPO steps, the policy with expanded card-count
-and action features won 57% against its frozen predecessor over 400 games
-With varied initialization seeds and starting seats.
+The bot is decent against humans. Great metric.
 
 [Recorded learning results](docs/results.json).
 
